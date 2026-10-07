@@ -336,13 +336,13 @@ export default function App() {
                 Official Employment Application
               </span>
               <h1 className="text-2xl sm:text-3xl md:text-4xl font-extrabold tracking-tight">
-                VISA FOR NATION
+                VISA FOR NATION PVT. LTD.
               </h1>
               <p className="text-red-100 text-xs sm:text-sm uppercase font-semibold tracking-wide mt-0.5">
                 Application Form for Employment
               </p>
               <p className="text-[11px] text-red-200 italic mt-0.5">
-                (To be filled by applicant in BOLD letters)
+                
               </p>
             </div>
           </div>
