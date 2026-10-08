@@ -1942,7 +1942,7 @@ export default function App() {
                 <div>
 
                   <label className="block text-xs font-bold text-slate-600 uppercase mb-1">
-                    Emergency Relative Name 1 *
+                     Relative Name 1 *
                   </label>
 
                   <input
@@ -2039,7 +2039,7 @@ export default function App() {
                 <div>
 
                   <label className="block text-xs font-bold text-slate-600 uppercase mb-1">
-                    Emergency Relative Name 2 *
+                   Relative Name 2 *
                   </label>
 
                   <input
