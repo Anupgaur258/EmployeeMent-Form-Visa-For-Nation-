@@ -1,14 +1,16 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import Lead from '../models/Lead.js';
+import { isDBConnected } from '../config/db.js';
 import { adminAuthMiddleware } from '../middleware/auth.js';
 import { deleteFileFromDrive } from '../services/googleDrive.js';
+import { getPendingSubmissions, deletePendingSubmission } from '../services/syncService.js';
 
 const router = express.Router();
 
 /**
  * POST /api/admin/login
- * Verify admin password from .env and return JWT token
+ * Verify admin password from .env and return signed JWT token
  */
 router.post('/login', async (req, res) => {
   try {
@@ -25,7 +27,7 @@ router.post('/login', async (req, res) => {
     if (password !== configuredPassword) {
       return res.status(401).json({
         success: false,
-        message: 'Invalid admin password. Access denied.'
+        message: 'Invalid admin credentials. Access denied.'
       });
     }
 
@@ -50,10 +52,30 @@ router.post('/login', async (req, res) => {
 
 /**
  * GET /api/admin/stats
- * Quick dashboard metrics
+ * Dashboard metrics combining MongoDB Atlas and persistent pending submissions
  */
 router.get('/stats', adminAuthMiddleware, async (req, res) => {
   try {
+    const pendingOffline = getPendingSubmissions();
+    const pendingOfflineCount = pendingOffline.length;
+
+    if (!isDBConnected()) {
+      return res.json({
+        success: true,
+        stats: {
+          total: pendingOfflineCount,
+          pending: pendingOfflineCount,
+          inReview: 0,
+          shortlisted: 0,
+          interviewed: 0,
+          selected: 0,
+          rejected: 0,
+          pendingOfflineSync: pendingOfflineCount
+        },
+        databaseConnected: false
+      });
+    }
+
     const total = await Lead.countDocuments();
     const pending = await Lead.countDocuments({ status: 'Pending' });
     const inReview = await Lead.countDocuments({ status: 'In Review' });
@@ -65,14 +87,16 @@ router.get('/stats', adminAuthMiddleware, async (req, res) => {
     res.json({
       success: true,
       stats: {
-        total,
-        pending,
+        total: total + pendingOfflineCount,
+        pending: pending + pendingOfflineCount,
         inReview,
         shortlisted,
         interviewed,
         selected,
-        rejected
-      }
+        rejected,
+        pendingOfflineSync: pendingOfflineCount
+      },
+      databaseConnected: true
     });
   } catch (error) {
     res.status(500).json({
@@ -85,35 +109,61 @@ router.get('/stats', adminAuthMiddleware, async (req, res) => {
 
 /**
  * GET /api/admin/leads
- * Get all leads sorted newest first (createdAt: -1)
+ * Get all leads sorted newest first (createdAt: -1) with sync status
  */
 router.get('/leads', adminAuthMiddleware, async (req, res) => {
   try {
     const { search, status } = req.query;
-    const query = {};
+    const pendingOffline = getPendingSubmissions();
 
+    let dbLeads = [];
+    if (isDBConnected()) {
+      const query = {};
+
+      if (status && status !== 'All') {
+        query.status = status;
+      }
+
+      if (search && search.trim()) {
+        const searchRegex = new RegExp(search.trim(), 'i');
+        query.$or = [
+          { fullName: searchRegex },
+          { emailId: searchRegex },
+          { mobileNo: searchRegex },
+          { positionJoiningFor: searchRegex },
+          { aadhaarNo: searchRegex }
+        ];
+      }
+
+      dbLeads = await Lead.find(query).sort({ createdAt: -1 });
+    }
+
+    // Filter pending offline leads matching query
+    let filteredPending = pendingOffline;
     if (status && status !== 'All') {
-      query.status = status;
+      filteredPending = filteredPending.filter((l) => l.status === status);
     }
-
     if (search && search.trim()) {
-      const searchRegex = new RegExp(search.trim(), 'i');
-      query.$or = [
-        { fullName: searchRegex },
-        { emailId: searchRegex },
-        { mobileNo: searchRegex },
-        { positionJoiningFor: searchRegex },
-        { aadhaarNo: searchRegex }
-      ];
+      const s = search.toLowerCase();
+      filteredPending = filteredPending.filter(
+        (l) =>
+          (l.fullName && l.fullName.toLowerCase().includes(s)) ||
+          (l.emailId && l.emailId.toLowerCase().includes(s)) ||
+          (l.mobileNo && l.mobileNo.includes(s)) ||
+          (l.positionJoiningFor && l.positionJoiningFor.toLowerCase().includes(s)) ||
+          (l.aadhaarNo && l.aadhaarNo.includes(s))
+      );
     }
 
-    // Always sort by createdAt: -1 so newest appears at the very top!
-    const leads = await Lead.find(query).sort({ createdAt: -1 });
+    // Combine: Unsynced pending leads displayed at the top
+    const combinedLeads = [...filteredPending, ...dbLeads];
 
     res.json({
       success: true,
-      count: leads.length,
-      leads
+      count: combinedLeads.length,
+      leads: combinedLeads,
+      databaseConnected: isDBConnected(),
+      pendingOfflineCount: pendingOffline.length
     });
   } catch (error) {
     res.status(500).json({
@@ -126,22 +176,36 @@ router.get('/leads', adminAuthMiddleware, async (req, res) => {
 
 /**
  * GET /api/admin/leads/:id
- * Get complete details of a specific user/lead
+ * Get complete details of a specific candidate lead
  */
 router.get('/leads/:id', adminAuthMiddleware, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
-    if (!lead) {
-      return res.status(404).json({
-        success: false,
-        message: 'Lead not found'
-      });
+    const { id } = req.params;
+
+    // Check pending offline submissions first if id starts with pending_
+    if (id.startsWith('pending_')) {
+      const pending = getPendingSubmissions();
+      const match = pending.find((p) => p._id === id);
+      if (match) {
+        return res.json({ success: true, lead: match, source: 'offline_queue' });
+      }
     }
 
-    res.json({
-      success: true,
-      lead
-    });
+    if (isDBConnected()) {
+      const lead = await Lead.findById(id);
+      if (lead) {
+        return res.json({ success: true, lead, source: 'mongodb' });
+      }
+    }
+
+    // Fallback: check pending queue by ID
+    const pending = getPendingSubmissions();
+    const match = pending.find((p) => p._id === id || p.clientSubmissionId === id);
+    if (match) {
+      return res.json({ success: true, lead: match, source: 'offline_queue' });
+    }
+
+    return res.status(404).json({ success: false, message: 'Lead not found' });
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -153,12 +217,28 @@ router.get('/leads/:id', adminAuthMiddleware, async (req, res) => {
 
 /**
  * PUT /api/admin/leads/:id
- * Update status, notes, or lead details (CRUD Update)
+ * Update status, notes, or lead details
  */
 router.put('/leads/:id', adminAuthMiddleware, async (req, res) => {
   try {
+    const { id } = req.params;
+
+    if (id.startsWith('pending_')) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot modify lead while pending synchronization to database.'
+      });
+    }
+
+    if (!isDBConnected()) {
+      return res.status(503).json({
+        success: false,
+        message: 'Database is disconnected. Cannot update lead at this time.'
+      });
+    }
+
     const updatedLead = await Lead.findByIdAndUpdate(
-      req.params.id,
+      id,
       { $set: req.body },
       { new: true, runValidators: true }
     );
@@ -186,11 +266,28 @@ router.put('/leads/:id', adminAuthMiddleware, async (req, res) => {
 
 /**
  * DELETE /api/admin/leads/:id
- * Delete lead and cleanup associated files from Drive (CRUD Delete)
+ * Delete lead and cleanup associated files from Drive / local storage
  */
 router.delete('/leads/:id', adminAuthMiddleware, async (req, res) => {
   try {
-    const lead = await Lead.findById(req.params.id);
+    const { id } = req.params;
+
+    if (id.startsWith('pending_')) {
+      const removed = deletePendingSubmission(id);
+      if (removed) {
+        return res.json({ success: true, message: 'Pending lead removed from queue' });
+      }
+      return res.status(404).json({ success: false, message: 'Lead not found in pending queue' });
+    }
+
+    if (!isDBConnected()) {
+      return res.status(503).json({
+        success: false,
+        message: 'Database is disconnected. Cannot delete lead from database at this time.'
+      });
+    }
+
+    const lead = await Lead.findById(id);
     if (!lead) {
       return res.status(404).json({
         success: false,
@@ -198,21 +295,23 @@ router.delete('/leads/:id', adminAuthMiddleware, async (req, res) => {
       });
     }
 
-    // Try deleting files from Google Drive
+    // Cleanup associated files
     if (lead.documents) {
-      const docEntries = Object.values(lead.documents.toObject ? lead.documents.toObject() : lead.documents);
+      const docEntries = Object.values(
+        lead.documents.toObject ? lead.documents.toObject() : lead.documents
+      );
       for (const doc of docEntries) {
-        if (doc && doc.fileId && doc.storageType === 'gdrive') {
+        if (doc && (doc.fileId || doc.fileName)) {
           try {
-            await deleteFileFromDrive(doc.fileId);
+            await deleteFileFromDrive(doc.fileId, doc.fileName);
           } catch (e) {
-            console.warn(`[Delete] File delete warning: ${e.message}`);
+            console.warn(`[Delete] File deletion notice: ${e.message}`);
           }
         }
       }
     }
 
-    await Lead.findByIdAndDelete(req.params.id);
+    await Lead.findByIdAndDelete(id);
 
     res.json({
       success: true,
