@@ -1,0 +1,78 @@
+/* Tailwind CSS Imports */
+@import "tailwindcss";
+
+/* Global Base Styles */
+* {
+  box-sizing: border-box;
+}
+  /* body styling */
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  background-color: #f1f5f9;
+  color: #0f172a;
+}
+
+/* Custom Input Enhancements */
+input:focus, 
+select:focus, 
+textarea:focus {
+  outline: none;
+}
+
+/* Remove arrow buttons from number inputs */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type="number"] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+
+/* Custom Date Picker Indicator Styling */
+input[type="date"]::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+  opacity: 0.6;
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator:hover {
+  opacity: 1;
+}
+
+/* Smooth Table Scrollbar */
+.overflow-x-auto::-webkit-scrollbar {
+  height: 6px;
+}
+
+.overflow-x-auto::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+
+.overflow-x-auto::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+/* Print Friendly Styles (For PDF / Printing) */
+@media print {
+  body {
+    background-color: #ffffff;
+  }
+
+  button {
+    display: none !important;
+  }
+
+  .shadow-xl, .shadow-lg, .shadow {
+    box-shadow: none !important;
+  }
+
+  .border {
+    border-color: #94a3b8 !important;
+  }
+}
