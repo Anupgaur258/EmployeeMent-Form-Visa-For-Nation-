@@ -1,20 +1,41 @@
 import express from 'express';
 import multer from 'multer';
+import crypto from 'crypto';
+import path from 'path';
 import Lead from '../models/Lead.js';
+import { isDBConnected } from '../config/db.js';
 import { uploadFileToDrive } from '../services/googleDrive.js';
+import { savePendingSubmission } from '../services/syncService.js';
 
 const router = express.Router();
 
-// Memory storage for direct streaming to Google Drive or local saving
+// Memory storage for file buffering before Drive/local streaming
 const storage = multer.memoryStorage();
+
+// Allowed MIME types for uploaded documents
+const ALLOWED_MIME_TYPES = [
+  'image/jpeg',
+  'image/png',
+  'image/jpg',
+  'image/webp',
+  'application/pdf'
+];
+
 const upload = multer({
   storage,
   limits: {
-    fileSize: 15 * 1024 * 1024 // 15MB limit per file
+    fileSize: 10 * 1024 * 1024 // 10MB per file limit
+  },
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Invalid file type for ${file.fieldname}. Allowed types: PDF, JPG, JPEG, PNG, WEBP.`));
+    }
   }
 });
 
-// List of all file fields allowed from the lead form
+// List of all expected document fields
 const fileFields = [
   { name: 'photo', maxCount: 1 },
   { name: 'updatedCv', maxCount: 1 },
@@ -45,23 +66,62 @@ const safeJsonParse = (val, defaultVal) => {
 };
 
 /**
- * POST /api/leads - Create new lead submission with file attachments
+ * POST /api/leads - Create new lead submission with file attachments and idempotency
  */
 router.post('/', upload.fields(fileFields), async (req, res) => {
   try {
     const body = req.body;
-    const applicantName = body.fullName || 'Applicant';
+    const applicantName = (body.fullName || '').trim();
 
-    console.log(`[Leads API] New lead submission received for: ${applicantName} (${body.emailId || 'no email'})`);
+    // Required Field Validations
+    if (!applicantName) {
+      return res.status(400).json({ success: false, message: 'Full Name is required.' });
+    }
+    if (!body.positionJoiningFor) {
+      return res.status(400).json({ success: false, message: 'Position is required.' });
+    }
+    if (!body.emailId) {
+      return res.status(400).json({ success: false, message: 'Email ID is required.' });
+    }
+    if (!body.mobileNo) {
+      return res.status(400).json({ success: false, message: 'Mobile Number is required.' });
+    }
 
-    // Process files and upload to Google Drive
+    // Stable Client Submission ID for Idempotency / Duplicate Prevention
+    const clientSubmissionId =
+      body.clientSubmissionId ||
+      crypto
+        .createHash('sha256')
+        .update(
+          `${body.emailId.toLowerCase().trim()}_${body.mobileNo.trim()}_${(body.positionJoiningFor || '').trim()}_${(body.applicationDate || '').trim()}`
+        )
+        .digest('hex');
+
+    // If MongoDB is connected, check for duplicates
+    if (isDBConnected()) {
+      const existing = await Lead.findOne({ clientSubmissionId });
+      if (existing) {
+        console.log(`[Leads API] Duplicate submission prevented for: ${applicantName} (${clientSubmissionId})`);
+        return res.status(200).json({
+          success: true,
+          message: 'Application already received and saved.',
+          leadId: existing._id,
+          lead: existing,
+          isDuplicate: true
+        });
+      }
+    }
+
+    console.log(`[Leads API] Processing application for: ${applicantName} (${body.emailId})`);
+
+    // Process uploaded documents
     const uploadedDocs = {};
     if (req.files) {
       for (const field of fileFields) {
         const fileArr = req.files[field.name];
         if (fileArr && fileArr.length > 0) {
           const file = fileArr[0];
-          console.log(`[Leads API] Uploading ${field.name} for ${applicantName}...`);
+          console.log(`[Leads API] Processing ${field.name} (${file.originalname}) for ${applicantName}...`);
           const docInfo = await uploadFileToDrive(file, applicantName, field.name);
           if (docInfo) {
             uploadedDocs[field.name] = docInfo;
@@ -78,16 +138,15 @@ router.post('/', upload.fields(fileFields), async (req, res) => {
     const bankDetails = safeJsonParse(body.bankDetails, {});
     const reference = safeJsonParse(body.reference, {});
 
-    // Boolean conversions
     const sameAsCurrentAddress = body.sameAsCurrentAddress === 'true' || body.sameAsCurrentAddress === true;
     const isFresher = body.isFresher === 'true' || body.isFresher === true;
 
-    // Create MongoDB Lead document
-    const newLead = new Lead({
+    // Build normalized Lead data structure
+    const leadData = {
       positionJoiningFor: body.positionJoiningFor || '',
       applicationDate: body.applicationDate || new Date().toISOString().split('T')[0],
 
-      fullName: body.fullName || '',
+      fullName: applicantName,
       fatherHusbandName: body.fatherHusbandName || '',
       fatherHusbandOccupation: body.fatherHusbandOccupation || '',
       dob: body.dob || '',
@@ -135,24 +194,47 @@ router.post('/', upload.fields(fileFields), async (req, res) => {
       declarationDate: body.declarationDate || '',
       signature: body.signature || '',
 
-      status: 'Pending'
-    });
+      status: 'Pending',
+      clientSubmissionId,
+      syncStatus: 'synced'
+    };
 
-    const savedLead = await newLead.save();
+    // Branch: MongoDB is connected vs disconnected
+    if (isDBConnected()) {
+      const newLead = new Lead(leadData);
+      const savedLead = await newLead.save();
 
-    console.log(`[Leads API] Lead saved successfully in MongoDB. ID: ${savedLead._id}`);
+      console.log(`[Leads API] ✅ Lead saved durably to MongoDB Atlas: ID ${savedLead._id}`);
 
-    res.status(201).json({
-      success: true,
-      message: 'Application submitted successfully!',
-      leadId: savedLead._id,
-      lead: savedLead
-    });
+      return res.status(201).json({
+        success: true,
+        message: 'Application submitted successfully!',
+        leadId: savedLead._id,
+        lead: savedLead,
+        syncStatus: 'synced'
+      });
+    } else {
+      // Disconnected: Store in durable persistent queue but DO NOT claim false success
+      leadData.syncStatus = 'pending';
+      const queuedLead = savePendingSubmission(leadData);
+
+      console.warn(`[Leads API] ⚠️ Database disconnected. Lead queued in persistent storage (ID: ${queuedLead._id}).`);
+
+      return res.status(503).json({
+        success: false,
+        message:
+          'Database is temporarily unavailable. Your application has been securely queued offline and will be synchronized once MongoDB Atlas connectivity is restored.',
+        error: 'Database unavailable',
+        leadId: queuedLead._id,
+        clientSubmissionId,
+        queued: true
+      });
+    }
   } catch (error) {
     console.error('[Leads API] Error creating lead:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to submit application. Please try again.',
+      message: error.message || 'Failed to submit application. Please try again.',
       error: error.message
     });
   }

@@ -173,7 +173,15 @@ const LeadSchema = new mongoose.Schema(
       enum: ['Pending', 'In Review', 'Shortlisted', 'Interviewed', 'Selected', 'Rejected'],
       default: 'Pending'
     },
-    adminNotes: { type: String, default: '' }
+    adminNotes: { type: String, default: '' },
+
+    // Idempotency & Sync Tracking
+    clientSubmissionId: { type: String, sparse: true, index: true },
+    syncStatus: {
+      type: String,
+      enum: ['synced', 'pending'],
+      default: 'synced'
+    }
   },
   {
     timestamps: true // adds createdAt and updatedAt
